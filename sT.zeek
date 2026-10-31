@@ -1,7 +1,9 @@
+
 type ipRec: record {
     noticeCounter: int;
     openPorts: set[port];
     closedPorts: set[port];
+    connCount: int &default=0; # counts matching connections, because the target only has 5 open ports
 };
 
 global a: table[addr] of table[addr] of ipRec;
@@ -13,73 +15,45 @@ redef enum Notice::Type += {
 
 function raiseNotice(orig_host: addr, resp_host: addr)
 	{
-	local i: int = |a[orig_host][resp_host]$openPorts| + |a[orig_host][resp_host]$closedPorts|;
-	if (modulo(i, threshold) == 0)
+	a[orig_host][resp_host]$connCount += 1; # count this connection (not distinct ports like in -sS)
+	if (a[orig_host][resp_host]$connCount >= threshold) # compare connCount with the threshold, we count connections
 	{
 		NOTICE([$note=sT_Port_Scanning,
-        $msg=fmt("%s appears to port scanning using nmap -sT. Amount of ports likely scanned %d. Notice nr. %d. Openports %d",
-                 orig_host, 
-				 i, 
-				 a[orig_host][resp_host]$noticeCounter, 
-				 |a[orig_host][resp_host]$openPorts|)]);
-		a[orig_host][resp_host]$noticeCounter += 1;
-	}
+        $msg=fmt("%s appears to port scanning using nmap -sT. Connections without data %d. Notice nr. %d",
+                 orig_host, a[orig_host][resp_host]$connCount, a[orig_host][resp_host]$noticeCounter)]);
+		a[orig_host][resp_host]$noticeCounter += 1; # The number of previous Notices goes up after each Notice
+		a[orig_host][resp_host]$connCount = 0; # we start counting over after every Notice
+	} # message shows connections without data instead of ports
 	}
 
-event connection_reset(c : connection)
+event connection_state_remove(c : connection) # changed to connection_state_remove, so the history is final when we check it
 	{
+	if ( ! c?$history || c$history != "ShAR" ) # only count history exactly ShAR (handshake finished, no data), to seperate -sT from -sS
+		return;
+	
 	local originator_host: addr = c$id$orig_h;
 	local responder_host: addr = c$id$resp_h;
     local responder_port: port = c$id$resp_p;
     local empty_ports: set[port] = set();
     
-	if ( c$history == "ShAR" || c$history == "ShAdR" )
-		{
-		if ( originator_host !in a )
-			{
-				a[originator_host] = table();
-				a[originator_host][responder_host] = [$noticeCounter=0, $openPorts=set(responder_port), $closedPorts=empty_ports];
-			}
-		else if ( responder_host !in a[originator_host] )
-			{
-				a[originator_host][responder_host] = [$noticeCounter=0, $openPorts=set(responder_port), $closedPorts=empty_ports];
-			}
-		else
-			{
-				a[originator_host][responder_host]$openPorts += set(responder_port);
-				raiseNotice(originator_host, responder_host);
-			}
-		}
-	}
-	
-event connection_rejected(c: connection)
-    {
-    local originator_host: addr = c$id$orig_h;
-    local responder_host: addr = c$id$resp_h;
-    local responder_port: port = c$id$resp_p;
-    local empty_ports: set[port] = set();
-
     if ( originator_host !in a )
     {
-        a[originator_host] = table();
-		a[originator_host][responder_host] = [$noticeCounter=0, $openPorts=empty_ports, $closedPorts=set(responder_port)];
-		return;
+    	a[originator_host] = table();
+		a[originator_host][responder_host] = [$noticeCounter=0, $openPorts=set(responder_port), $closedPorts=empty_ports];
 	}
 	
 	if ( responder_host !in a[originator_host] )
 	{
-		a[originator_host][responder_host] = [$noticeCounter=0, $openPorts=empty_ports, $closedPorts=set(responder_port)];
-		return;
+		a[originator_host][responder_host] = [$noticeCounter=0, $openPorts=set(responder_port), $closedPorts=empty_ports];
 	}
 	
-	if ( responder_port !in a[originator_host][responder_host]$closedPorts )
-		{
-			a[originator_host][responder_host]$closedPorts += set(responder_port);
-			raiseNotice(originator_host, responder_host);
-		}
-
-    }
-
+	a[originator_host][responder_host]$openPorts += set(responder_port);
+	raiseNotice(originator_host, responder_host); # Called for every ShAR connection (we dont check new-port), because we count connections
+	
+	}
+	
+# removed connection_rejected: closed ports look the same in -sS and -sT, so we do not count them
+	
 event zeek_done()
     {
     for ( orig_host in a )
